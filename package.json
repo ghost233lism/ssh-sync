@@ -1,0 +1,72 @@
+{
+  "name": "ssh-sync",
+  "displayName": "SSH Sync",
+  "description": "Synchronize a local folder with a remote SSH folder using ssh/scp.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:sshSync.bindFolder",
+    "onCommand:sshSync.syncNow",
+    "onCommand:sshSync.openRemoteTerminal",
+    "onCommand:sshSync.unbindFolder",
+    "onTerminalProfile:sshSync.remoteTerminal",
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sshSync.bindFolder",
+        "title": "SSH Sync: Bind Folder"
+      },
+      {
+        "command": "sshSync.syncNow",
+        "title": "SSH Sync: Sync Now"
+      },
+      {
+        "command": "sshSync.openRemoteTerminal",
+        "title": "SSH Sync: Open Remote Terminal"
+      },
+      {
+        "command": "sshSync.unbindFolder",
+        "title": "SSH Sync: Unbind Folder"
+      }
+    ],
+    "terminal": {
+      "profiles": [
+        {
+          "id": "sshSync.remoteTerminal",
+          "title": "SSH Sync Remote Terminal",
+          "icon": "remote"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SSH Sync",
+      "properties": {
+        "sshSync.defaultPollInterval": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 1000,
+          "description": "Default remote polling interval in milliseconds when sync-setting.json uses realtime or is missing."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5"
+  }
+}
