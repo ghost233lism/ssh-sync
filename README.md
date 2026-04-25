@@ -1,6 +1,6 @@
 # SSH Sync
 
-[English](README.md) | [中文](README_ZH.md)
+[English](https://github.com/ghost233lism/ssh-sync/blob/main/README.md) | [中文](https://github.com/ghost233lism/ssh-sync/blob/main/README_ZH.md)
 
 SSH Sync is a VS Code extension for binding a local folder to a remote SSH folder and keeping both sides synchronized with the system `ssh` and `scp` commands.
 
@@ -100,4 +100,3 @@ Ignore rules support common file, folder, and extension patterns.
 ## Extension Setting
 
 - `sshSync.defaultPollInterval`: default polling interval in milliseconds when `sync-setting.json` uses `"realtime"` or is missing.
-

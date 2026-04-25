@@ -4,6 +4,10 @@
   "description": "Synchronize a local folder with a remote SSH folder using ssh/scp.",
   "version": "0.0.1",
   "publisher": "ghost233lism",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ghost233lism/ssh-sync.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
