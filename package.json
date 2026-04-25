@@ -13,6 +13,10 @@
   "activationEvents": [
     "onCommand:sshSync.bindFolder",
     "onCommand:sshSync.syncNow",
+    "onCommand:sshSync.openRemoteFolder",
+    "onCommand:sshSync.refreshRemoteExplorer",
+    "onCommand:sshSync.newRemoteFile",
+    "onCommand:sshSync.newRemoteFolder",
     "onCommand:sshSync.openRemoteTerminal",
     "onCommand:sshSync.unbindFolder",
     "onTerminalProfile:sshSync.remoteTerminal",
@@ -28,6 +32,26 @@
       {
         "command": "sshSync.syncNow",
         "title": "SSH Sync: Sync Now"
+      },
+      {
+        "command": "sshSync.openRemoteFolder",
+        "title": "SSH Sync: Open Remote Folder",
+        "icon": "$(remote-explorer)"
+      },
+      {
+        "command": "sshSync.refreshRemoteExplorer",
+        "title": "SSH Sync: Refresh Remote Folder",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "sshSync.newRemoteFile",
+        "title": "SSH Sync: New Remote File",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "sshSync.newRemoteFolder",
+        "title": "SSH Sync: New Remote Folder",
+        "icon": "$(new-folder)"
       },
       {
         "command": "sshSync.openRemoteTerminal",
@@ -47,6 +71,57 @@
         }
       ]
     },
+    "views": {
+      "explorer": [
+        {
+          "id": "sshSync.remoteExplorer",
+          "name": "SSH Sync Remote"
+        }
+      ]
+    },
+    "menus": {
+      "file/newFile": [
+        {
+          "command": "sshSync.openRemoteFolder",
+          "group": "navigation@30"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "sshSync.newRemoteFile",
+          "when": "view == sshSync.remoteExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sshSync.newRemoteFolder",
+          "when": "view == sshSync.remoteExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sshSync.refreshRemoteExplorer",
+          "when": "view == sshSync.remoteExplorer",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "sshSync.newRemoteFile",
+          "when": "view == sshSync.remoteExplorer && viewItem == directory",
+          "group": "inline@1"
+        },
+        {
+          "command": "sshSync.newRemoteFolder",
+          "when": "view == sshSync.remoteExplorer && viewItem == directory",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "sshSync.remoteExplorer",
+        "contents": "[Open Remote Folder](command:sshSync.openRemoteFolder)"
+      }
+    ],
     "configuration": {
       "title": "SSH Sync",
       "properties": {

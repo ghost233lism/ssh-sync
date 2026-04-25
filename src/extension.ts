@@ -24,6 +24,11 @@ interface BindingConfig {
   connection: ConnectionConfig;
 }
 
+interface RemoteFolderConfig {
+  remotePath: string;
+  connection: ConnectionConfig;
+}
+
 interface SyncSettings {
   interval: 'realtime' | number;
   ignore: string[];
@@ -51,23 +56,60 @@ interface SshHostConfig {
   identityFile?: string;
 }
 
+interface RemoteTreeEntry {
+  relativePath: string;
+  name: string;
+  kind: FileKind;
+  size: number;
+}
+
+interface RemoteEditSession {
+  localPath: string;
+  remoteRelativePath: string;
+  remoteConfig: RemoteFolderConfig;
+}
+
 const bindingKey = 'sshSync.binding';
+const remoteExplorerKey = 'sshSync.remoteExplorer';
 const stateKey = 'sshSync.state';
 const passwordKey = 'sshSync.password';
 const passphraseKey = 'sshSync.privateKeyPassphrase';
 const settingsFileName = 'sync-setting.json';
 
 let manager: SyncManager | undefined;
+let remoteExplorer: RemoteExplorerProvider | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   manager = new SyncManager(context);
+  remoteExplorer = new RemoteExplorerProvider(manager);
   context.subscriptions.push(manager);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('sshSync.bindFolder', () => manager?.bindFolder()),
     vscode.commands.registerCommand('sshSync.syncNow', () => manager?.syncNow()),
+    vscode.commands.registerCommand('sshSync.openRemoteFolder', async () => {
+      if (await manager?.openRemoteFolderView()) {
+        remoteExplorer?.refresh();
+      }
+    }),
+    vscode.commands.registerCommand('sshSync.refreshRemoteExplorer', () => remoteExplorer?.refresh()),
+    vscode.commands.registerCommand('sshSync.openRemoteTreeItem', (item: RemoteTreeItem) => manager?.openRemoteFile(item.entry.relativePath)),
+    vscode.commands.registerCommand('sshSync.newRemoteFile', async (item?: RemoteTreeItem) => {
+      const created = await manager?.createRemoteFile(item?.entry);
+      if (created) {
+        remoteExplorer?.refresh(item);
+      }
+    }),
+    vscode.commands.registerCommand('sshSync.newRemoteFolder', async (item?: RemoteTreeItem) => {
+      const created = await manager?.createRemoteFolder(item?.entry);
+      if (created) {
+        remoteExplorer?.refresh(item);
+      }
+    }),
     vscode.commands.registerCommand('sshSync.openRemoteTerminal', () => manager?.openRemoteTerminal()),
     vscode.commands.registerCommand('sshSync.unbindFolder', () => manager?.unbindFolder()),
+    vscode.workspace.onDidSaveTextDocument(document => manager?.saveRemoteDocument(document)),
+    vscode.window.createTreeView('sshSync.remoteExplorer', { treeDataProvider: remoteExplorer }),
     vscode.window.registerTerminalProfileProvider('sshSync.remoteTerminal', {
       provideTerminalProfile: () => manager?.provideRemoteTerminalProfile()
     })
@@ -82,6 +124,7 @@ export function deactivate(): void {
 
 class SyncManager implements vscode.Disposable {
   private binding?: BindingConfig;
+  private remoteExplorerConfig?: RemoteFolderConfig;
   private watcher?: vscode.FileSystemWatcher;
   private pollTimer?: NodeJS.Timeout;
   private localPollTimer?: NodeJS.Timeout;
@@ -90,6 +133,7 @@ class SyncManager implements vscode.Disposable {
   private suppressLocalEvents = false;
   private readonly output = vscode.window.createOutputChannel('SSH Sync');
   private readonly statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  private readonly remoteEditSessions = new Map<string, RemoteEditSession>();
   private syncStatus: SyncStatus = 'synced';
   private fullySynced = true;
 
@@ -100,7 +144,9 @@ class SyncManager implements vscode.Disposable {
   }
 
   async restore(): Promise<void> {
-    this.binding = this.context.workspaceState.get<BindingConfig>(bindingKey);
+    this.binding = this.context.workspaceState.get<BindingConfig>(bindingKey)
+      ?? this.context.globalState.get<BindingConfig>(bindingKey);
+    this.remoteExplorerConfig = this.context.workspaceState.get<RemoteFolderConfig>(remoteExplorerKey);
     if (this.binding) {
       await this.start();
       void this.enqueueSync('restore');
@@ -163,6 +209,7 @@ class SyncManager implements vscode.Disposable {
 
       this.binding = binding;
       await this.context.workspaceState.update(bindingKey, binding);
+      await this.context.globalState.update(bindingKey, binding);
       const state = await this.buildCurrentState(binding);
       await this.saveState(state);
       this.updateStatus(isStateFullySynced(state) ? 'synced' : 'failed', isStateFullySynced(state));
@@ -182,6 +229,201 @@ class SyncManager implements vscode.Disposable {
       title: 'SSH Sync: Synchronizing',
       cancellable: false
     }, () => this.enqueueSync('manual'));
+  }
+
+  async openRemoteFolderView(): Promise<boolean> {
+    const config = await this.collectRemoteExplorerConfig();
+    if (!config) {
+      return false;
+    }
+    this.remoteExplorerConfig = config;
+    await this.context.workspaceState.update(remoteExplorerKey, config);
+    await vscode.commands.executeCommand('workbench.view.explorer');
+    await vscode.commands.executeCommand('sshSync.remoteExplorer.focus');
+    return true;
+  }
+
+  async listRemoteChildren(parentRelativePath: string): Promise<RemoteTreeEntry[]> {
+    if (!this.remoteExplorerConfig) {
+      return [];
+    }
+
+    return listRemoteDirectory(this.remoteExplorerConfig, parentRelativePath, this.context);
+  }
+
+  async openRemoteFile(relativePath: string): Promise<void> {
+    if (!this.remoteExplorerConfig) {
+      vscode.window.showWarningMessage('SSH Sync has no remote folder open.');
+      return;
+    }
+
+    const cacheRoot = safeCacheSegment(`${this.remoteExplorerConfig.connection.username}@${this.remoteExplorerConfig.connection.host}_${this.remoteExplorerConfig.remotePath}`);
+    const targetPath = path.join(this.context.globalStorageUri.fsPath, 'remote-files', cacheRoot, relativePath);
+    await scpDownloadFileTo(this.remoteExplorerConfig, relativePath, targetPath, this.context);
+    this.remoteEditSessions.set(normalizeLocalKey(targetPath), {
+      localPath: targetPath,
+      remoteRelativePath: relativePath,
+      remoteConfig: cloneRemoteConfig(this.remoteExplorerConfig)
+    });
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(targetPath));
+    await vscode.window.showTextDocument(document, { preview: false });
+  }
+
+  async saveRemoteDocument(document: vscode.TextDocument): Promise<void> {
+    if (document.uri.scheme !== 'file') {
+      return;
+    }
+
+    const session = this.remoteEditSessions.get(normalizeLocalKey(document.uri.fsPath));
+    if (!session) {
+      return;
+    }
+
+    try {
+      await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: `SSH Sync: Saving ${path.posix.basename(session.remoteRelativePath)}`,
+        cancellable: false
+      }, async () => {
+        await scpUploadFileFrom(session.remoteConfig, session.remoteRelativePath, session.localPath, this.context);
+        await this.mirrorRemoteChangeToBinding(session.remoteConfig, session.remoteRelativePath, 'file');
+      });
+      remoteExplorer?.refresh();
+      vscode.window.setStatusBarMessage(`SSH Sync: saved remote ${session.remoteRelativePath}`, 2500);
+    } catch (error) {
+      vscode.window.showErrorMessage(`SSH Sync remote save failed: ${getErrorMessage(error)}`);
+    }
+  }
+
+  async createRemoteFile(parent?: RemoteTreeEntry): Promise<boolean> {
+    const created = await this.createRemoteEntry('file', parent);
+    if (!created) {
+      return false;
+    }
+    await this.openRemoteFile(created);
+    return true;
+  }
+
+  async createRemoteFolder(parent?: RemoteTreeEntry): Promise<boolean> {
+    return (await this.createRemoteEntry('directory', parent)) !== undefined;
+  }
+
+  private async createRemoteEntry(kind: FileKind, parent?: RemoteTreeEntry): Promise<string | undefined> {
+    if (!this.remoteExplorerConfig) {
+      vscode.window.showWarningMessage('SSH Sync has no remote folder open.');
+      return undefined;
+    }
+
+    const parentRelativePath = parent?.kind === 'directory'
+      ? parent.relativePath
+      : parent?.relativePath ? path.posix.dirname(parent.relativePath) : '';
+    const name = await vscode.window.showInputBox({
+      title: kind === 'file' ? 'SSH Sync: New Remote File' : 'SSH Sync: New Remote Folder',
+      prompt: 'Enter a name or relative path under the selected remote folder',
+      ignoreFocusOut: true,
+      validateInput: value => validateRemoteChildPath(value)
+    });
+    if (!name) {
+      return undefined;
+    }
+
+    const relativePath = joinRemoteRelative(parentRelativePath, toPosix(name.trim()));
+    const absolutePath = remoteJoin(this.remoteExplorerConfig.remotePath, relativePath);
+    const parentDirectory = remoteJoin(this.remoteExplorerConfig.remotePath, path.posix.dirname(relativePath));
+    const command = kind === 'directory'
+      ? `mkdir -p ${shQuote(absolutePath)}`
+      : `mkdir -p ${shQuote(parentDirectory)} && if test -e ${shQuote(absolutePath)}; then echo "Remote file already exists: ${absolutePath}" >&2; exit 1; fi && : > ${shQuote(absolutePath)}`;
+
+    try {
+      await sshExec(this.remoteExplorerConfig, command, this.context);
+      await this.mirrorRemoteChangeToBinding(this.remoteExplorerConfig, relativePath, kind);
+      return relativePath;
+    } catch (error) {
+      vscode.window.showErrorMessage(`SSH Sync remote create failed: ${getErrorMessage(error)}`);
+      return undefined;
+    }
+  }
+
+  async mirrorRemoteChangeToBinding(remoteConfig: RemoteFolderConfig, remoteRelativePath: string, kind: FileKind): Promise<void> {
+    this.binding ??= this.context.workspaceState.get<BindingConfig>(bindingKey)
+      ?? this.context.globalState.get<BindingConfig>(bindingKey);
+    if (!this.binding) {
+      this.log(`Remote ${kind} changed but no binding is available: ${remoteJoin(remoteConfig.remotePath, remoteRelativePath)}`);
+      return;
+    }
+
+    const absoluteRemotePath = remoteJoin(remoteConfig.remotePath, remoteRelativePath);
+    const bindingRelativePath = remoteRelativePathWithin(this.binding.remotePath, absoluteRemotePath);
+    if (bindingRelativePath === undefined) {
+      this.log(`Remote edit is outside bound folder: ${absoluteRemotePath}`);
+      return;
+    }
+    if (!sameConnection(this.binding.connection, remoteConfig.connection)) {
+      this.log(`Remote edit connection differs from binding; mirroring by path only: ${absoluteRemotePath}`);
+    }
+
+    this.suppressLocalEvents = true;
+    this.fullySynced = false;
+    this.updateStatus('syncing', false);
+    try {
+      const localTargetPath = path.join(this.binding.localPath, bindingRelativePath);
+      if (kind === 'directory') {
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(localTargetPath));
+      } else {
+        await this.writeRemoteFileIntoLocalWorkspace(remoteConfig, remoteRelativePath, localTargetPath);
+      }
+      const updated = await this.buildCurrentState(this.binding);
+      await this.saveState(updated);
+      this.fullySynced = isStateFullySynced(updated);
+      this.updateStatus(this.fullySynced ? 'synced' : 'failed', this.fullySynced);
+      this.log(`Mirrored remote ${kind} to local: ${bindingRelativePath}`);
+    } finally {
+      this.suppressLocalEvents = false;
+    }
+  }
+
+  private async writeRemoteFileIntoLocalWorkspace(remoteConfig: RemoteFolderConfig, remoteRelativePath: string, localTargetPath: string): Promise<void> {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-sync-local-mirror-'));
+    const tempFile = path.join(tempDir, path.basename(localTargetPath) || 'content');
+    try {
+      await scpDownloadFileTo(remoteConfig, remoteRelativePath, tempFile, this.context);
+      const content = await fs.readFile(tempFile);
+      const localUri = vscode.Uri.file(localTargetPath);
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(localTargetPath)));
+      await vscode.workspace.fs.writeFile(localUri, content);
+      await this.refreshOpenLocalDocument(localTargetPath, content);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  private async refreshOpenLocalDocument(localPath: string, content: Uint8Array): Promise<void> {
+    const key = normalizeLocalKey(localPath);
+    const document = vscode.workspace.textDocuments.find(item => item.uri.scheme === 'file' && normalizeLocalKey(item.uri.fsPath) === key);
+    if (!document) {
+      return;
+    }
+    if (document.isDirty) {
+      vscode.window.showWarningMessage(`SSH Sync updated ${path.basename(localPath)} on disk, but the open local editor has unsaved changes.`);
+      return;
+    }
+
+    let text: string;
+    try {
+      text = await vscode.workspace.decode(content);
+    } catch {
+      return;
+    }
+    if (document.getText() === text) {
+      return;
+    }
+
+    const lastLine = document.lineAt(Math.max(0, document.lineCount - 1));
+    const fullRange = new vscode.Range(0, 0, lastLine.lineNumber, lastLine.text.length);
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(document.uri, fullRange, text);
+    await vscode.workspace.applyEdit(edit);
+    await document.save();
   }
 
   async openRemoteTerminal(): Promise<void> {
@@ -254,6 +496,7 @@ class SyncManager implements vscode.Disposable {
     this.stop();
     this.binding = undefined;
     await this.context.workspaceState.update(bindingKey, undefined);
+    await this.context.globalState.update(bindingKey, undefined);
     await this.context.workspaceState.update(stateKey, undefined);
     vscode.window.showInformationMessage('SSH Sync binding removed.');
   }
@@ -621,6 +864,56 @@ class SyncManager implements vscode.Disposable {
     return connection;
   }
 
+  private async collectRemoteExplorerConfig(): Promise<RemoteFolderConfig | undefined> {
+    let connection: ConnectionConfig | undefined;
+    if (this.binding) {
+      const selected = await vscode.window.showQuickPick([
+        {
+          label: 'Use Bound SSH Connection',
+          description: `${this.binding.connection.username}@${this.binding.connection.host}`,
+          value: 'bound' as const
+        },
+        {
+          label: 'Choose Another SSH Host',
+          description: 'Use ~/.ssh/config or enter a new host',
+          value: 'other' as const
+        }
+      ], {
+        title: 'SSH Sync: Remote Folder Connection',
+        placeHolder: 'Choose which SSH connection to browse',
+        ignoreFocusOut: true
+      });
+      if (!selected) {
+        return undefined;
+      }
+      connection = selected.value === 'bound' ? this.binding.connection : await this.collectConnection();
+    } else {
+      connection = await this.collectConnection();
+    }
+
+    if (!connection) {
+      return undefined;
+    }
+
+    const defaultPath = this.remoteExplorerConfig?.remotePath ?? this.binding?.remotePath ?? '/home';
+    const remotePath = await vscode.window.showInputBox({
+      title: 'SSH Sync: Open Remote Folder',
+      prompt: 'Enter the absolute remote folder path to browse. This folder is not synchronized unless it is also your bound folder.',
+      value: defaultPath,
+      placeHolder: '/home/user/project',
+      ignoreFocusOut: true,
+      validateInput: value => value.trim().startsWith('/') ? undefined : 'Remote folder must be an absolute path.'
+    });
+    if (!remotePath) {
+      return undefined;
+    }
+
+    return {
+      connection,
+      remotePath: normalizeRemotePath(remotePath)
+    };
+  }
+
   private async connectionFromSshHost(host: SshHostConfig): Promise<ConnectionConfig | undefined> {
     const username = host.user ?? await vscode.window.showInputBox({
       title: 'SSH Sync: Username',
@@ -709,7 +1002,54 @@ class SyncManager implements vscode.Disposable {
   }
 }
 
-async function sshExec(binding: BindingConfig, command: string, context: vscode.ExtensionContext): Promise<string> {
+class RemoteExplorerProvider implements vscode.TreeDataProvider<RemoteTreeItem> {
+  private readonly changeEmitter = new vscode.EventEmitter<RemoteTreeItem | undefined | null | void>();
+  readonly onDidChangeTreeData = this.changeEmitter.event;
+
+  constructor(private readonly manager: SyncManager) {}
+
+  refresh(item?: RemoteTreeItem): void {
+    this.changeEmitter.fire(item);
+  }
+
+  getTreeItem(element: RemoteTreeItem): vscode.TreeItem {
+    return element;
+  }
+
+  async getChildren(element?: RemoteTreeItem): Promise<RemoteTreeItem[]> {
+    const parent = element?.entry.relativePath ?? '';
+    try {
+      const entries = await this.manager.listRemoteChildren(parent);
+      return entries.map(entry => new RemoteTreeItem(entry));
+    } catch (error) {
+      vscode.window.showErrorMessage(`SSH Sync remote folder failed: ${getErrorMessage(error)}`);
+      return [];
+    }
+  }
+}
+
+class RemoteTreeItem extends vscode.TreeItem {
+  constructor(readonly entry: RemoteTreeEntry) {
+    super(
+      entry.name,
+      entry.kind === 'directory' ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+    );
+    this.contextValue = entry.kind;
+    this.resourceUri = vscode.Uri.from({ scheme: 'ssh-sync-remote', path: `/${entry.relativePath}` });
+    this.tooltip = entry.relativePath;
+    this.description = entry.kind === 'file' ? formatFileSize(entry.size) : undefined;
+    this.iconPath = new vscode.ThemeIcon(entry.kind === 'directory' ? 'folder' : 'file');
+    if (entry.kind === 'file') {
+      this.command = {
+        command: 'sshSync.openRemoteTreeItem',
+        title: 'Open Remote File',
+        arguments: [this]
+      };
+    }
+  }
+}
+
+async function sshExec(binding: RemoteFolderConfig, command: string, context: vscode.ExtensionContext): Promise<string> {
   const args = sshArgs(binding.connection, command);
   return runCommand('ssh', args, context, binding.connection);
 }
@@ -735,6 +1075,45 @@ async function scpDownload(binding: BindingConfig, relativePath: string, context
     ? `${binding.remotePath}/.`
     : remoteJoin(binding.remotePath, relativePath);
   await runCommand('scp', scpArgs(binding.connection, ['-p', '-r', remoteScpTarget(binding, remoteSourcePath), localTarget]), context, binding.connection);
+}
+
+async function scpDownloadFileTo(binding: RemoteFolderConfig, relativePath: string, localFilePath: string, context: vscode.ExtensionContext): Promise<void> {
+  await fs.mkdir(path.dirname(localFilePath), { recursive: true });
+  await runCommand('scp', scpArgs(binding.connection, ['-p', remoteScpTarget(binding, remoteJoin(binding.remotePath, relativePath)), localFilePath]), context, binding.connection);
+}
+
+async function scpUploadFileFrom(binding: RemoteFolderConfig, relativePath: string, localFilePath: string, context: vscode.ExtensionContext): Promise<void> {
+  const remoteDirectory = remoteJoin(binding.remotePath, path.posix.dirname(toPosix(relativePath)));
+  await sshExec(binding, `mkdir -p ${shQuote(remoteDirectory)}`, context);
+  await runCommand('scp', scpArgs(binding.connection, ['-p', localFilePath, remoteScpTarget(binding, remoteJoin(binding.remotePath, relativePath))]), context, binding.connection);
+}
+
+async function listRemoteDirectory(binding: RemoteFolderConfig, relativePath: string, context: vscode.ExtensionContext): Promise<RemoteTreeEntry[]> {
+  const remoteDirectory = remoteJoin(binding.remotePath, relativePath);
+  const command = `find ${shQuote(remoteDirectory)} -mindepth 1 -maxdepth 1 \\( -type f -o -type d \\) -printf '%y\\0%s\\0%P\\0'`;
+  const output = await sshExec(binding, command, context);
+  const parts = output.split('\0');
+  const entries: RemoteTreeEntry[] = [];
+  for (let index = 0; index + 2 < parts.length; index += 3) {
+    const type = parts[index];
+    const size = Number(parts[index + 1]);
+    const name = parts[index + 2];
+    if (!name) {
+      continue;
+    }
+    entries.push({
+      relativePath: relativePath ? `${toPosix(relativePath)}/${name}` : name,
+      name,
+      kind: type === 'd' ? 'directory' : 'file',
+      size: type === 'd' ? 0 : size
+    });
+  }
+  return entries.sort((left, right) => {
+    if (left.kind !== right.kind) {
+      return left.kind === 'directory' ? -1 : 1;
+    }
+    return left.name.localeCompare(right.name);
+  });
 }
 
 async function deleteRemote(binding: BindingConfig, relativePath: string, context: vscode.ExtensionContext): Promise<void> {
@@ -1033,6 +1412,73 @@ function isStateFullySynced(state: SyncState): boolean {
   });
 }
 
+function cloneRemoteConfig(config: RemoteFolderConfig): RemoteFolderConfig {
+  return {
+    remotePath: config.remotePath,
+    connection: { ...config.connection }
+  };
+}
+
+function normalizeLocalKey(value: string): string {
+  return process.platform === 'win32' ? path.normalize(value).toLowerCase() : path.normalize(value);
+}
+
+function validateRemoteChildPath(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 'Name is required.';
+  }
+  const normalized = toPosix(trimmed);
+  if (normalized.startsWith('/')) {
+    return 'Use a relative name or path.';
+  }
+  if (normalized.split('/').some(part => !part || part === '.' || part === '..')) {
+    return 'Path segments cannot be empty, "." or "..".';
+  }
+  return undefined;
+}
+
+function joinRemoteRelative(parent: string, child: string): string {
+  const normalizedParent = toPosix(parent).replace(/^\/+|\/+$/g, '');
+  const normalizedChild = toPosix(child).replace(/^\/+|\/+$/g, '');
+  return normalizedParent ? `${normalizedParent}/${normalizedChild}` : normalizedChild;
+}
+
+function sameConnection(left: ConnectionConfig, right: ConnectionConfig): boolean {
+  return left.host === right.host
+    && left.username === right.username
+    && (left.usesSshConfig || right.usesSshConfig || left.port === right.port);
+}
+
+function remoteRelativePathWithin(root: string, remotePath: string): string | undefined {
+  const normalizedRoot = normalizeRemoteAbsolutePath(root);
+  const normalizedPath = normalizeRemoteAbsolutePath(remotePath);
+  if (normalizedPath === normalizedRoot) {
+    return '';
+  }
+  const prefix = `${normalizedRoot.replace(/\/+$/, '')}/`;
+  return normalizedPath.startsWith(prefix) ? normalizedPath.slice(prefix.length) : undefined;
+}
+
+function normalizeRemoteAbsolutePath(value: string): string {
+  const normalized = normalizeRemotePath(value).replace(/\/{2,}/g, '/');
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+}
+
+function safeCacheSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'remote';
+}
+
+function formatFileSize(size: number): string {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 async function ensureLocalDirectory(localPath: string): Promise<void> {
   await fs.mkdir(localPath, { recursive: true });
 }
@@ -1047,7 +1493,7 @@ async function isRemoteDirectoryEmpty(binding: BindingConfig, context: vscode.Ex
   return output.trim().length === 0;
 }
 
-function remoteScpTarget(binding: BindingConfig, remotePath: string): string {
+function remoteScpTarget(binding: RemoteFolderConfig, remotePath: string): string {
   return `${binding.connection.username}@${binding.connection.host}:${escapeScpRemotePath(remotePath)}`;
 }
 
