@@ -3,7 +3,7 @@
   "displayName": "SSH Sync",
   "description": "Synchronize a local folder with a remote SSH folder using ssh/scp.",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "ghost233lism",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -127,8 +127,8 @@
       "properties": {
         "sshSync.defaultPollInterval": {
           "type": "number",
-          "default": 3000,
-          "minimum": 1000,
+          "default": 500,
+          "minimum": 500,
           "description": "Default remote polling interval in milliseconds when sync-setting.json uses realtime or is missing."
         }
       }
