@@ -205,7 +205,7 @@ class SyncManager implements vscode.Disposable {
       return false;
     }
 
-    if (this.syncStatus === 'syncing' || !this.fullySynced) {
+    if (!this.fullySynced) {
       const choice = await vscode.window.showWarningMessage(
         'SSH Sync: Local and remote folders are not fully synchronized. Opening a remote terminal now may operate on stale files.',
         { modal: true },
@@ -299,6 +299,7 @@ class SyncManager implements vscode.Disposable {
     const trigger = () => {
       if (!this.suppressLocalEvents) {
         this.log('Local file event detected.');
+        this.fullySynced = false;
         void this.enqueueSync('local');
       }
     };
@@ -349,8 +350,7 @@ class SyncManager implements vscode.Disposable {
     }
 
     const binding = this.binding;
-    this.fullySynced = false;
-    this.updateStatus('syncing', false);
+    this.updateStatus('syncing', this.fullySynced);
     this.log(`Sync started: ${_reason}`);
     const previous = this.context.workspaceState.get<SyncState>(stateKey, {});
     const [localEntries, remoteEntries] = await Promise.all([
